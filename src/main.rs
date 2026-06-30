@@ -1,11 +1,13 @@
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
-use rig::completion::ToolDefinition;
+use rig::completion::{Chat, Message, ToolDefinition};
 use rig::providers::ollama;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::future::IntoFuture;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::process::Command;
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -14,7 +16,9 @@ struct CmdArgs {
 }
 
 #[derive(Debug, Clone)]
-struct CliExecutionTool;
+struct CliExecutionTool {
+    seconds: Arc<AtomicU64>,
+}
 
 impl Tool for CliExecutionTool {
     const NAME: &'static str = "execute_bash_command";
@@ -42,7 +46,10 @@ impl Tool for CliExecutionTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.seconds.store(0, Ordering::SeqCst);
+
         println!("\n[Tool Executing] Executing command: {}", args.command);
+
         let output = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(["/C", &args.command])
@@ -59,6 +66,9 @@ impl Tool for CliExecutionTool {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+                self.seconds.store(0, Ordering::SeqCst);
+
                 if out.status.success() {
                     println!("[Tool Success] Execution was successful.");
                     Ok(stdout)
@@ -68,6 +78,7 @@ impl Tool for CliExecutionTool {
                 }
             }
             Err(e) => {
+                self.seconds.store(0, Ordering::SeqCst);
                 println!("[Tool Fatal] Failed to start the command itself.");
                 Ok(format!("Failed to execute command: {}", e))
             }
@@ -89,19 +100,20 @@ async fn main() {
         }
     }
 
-    // Ollama client initialization
+    let shared_seconds = Arc::new(AtomicU64::new(0));
     let ollama_client =
         ollama::Client::new("http://localhost:11434").expect("Failed to initialize Ollama client");
 
-    // CLI agent construction
+    let mut conversation_history: Vec<Message> = vec![];
+
     let agent = ollama_client
-        .agent(&model_name) // Please adjust the model name as needed
+        .agent(&model_name)
         .preamble("
             You are an excellent CLI (Command Line) agent that supports the user's PC operations.
             Use the provided `execute_bash_command` tool appropriately to check the actual system status based on the user's instructions,
             and answer the user based on those results.
         ")
-        .tool(CliExecutionTool)
+        .tool(CliExecutionTool { seconds: Arc::clone(&shared_seconds) })
         .build();
 
     println!("==================================================");
@@ -109,61 +121,55 @@ async fn main() {
     println!("   Type '/exit' to quit.");
     println!("==================================================");
 
-    // Start of the interactive infinite loop
     loop {
         print!("\nUser>");
-        // Flush stdout to display prompt immediately
         io::stdout().flush().expect("Failed to flush");
 
         let mut input = String::new();
-        // Read user input
         io::stdin()
             .read_line(&mut input)
             .expect("Failed to read input");
 
-        // Remove newline characters
         let user_prompt = input.trim();
 
-        // Exit check
         if user_prompt.eq_ignore_ascii_case("/exit") {
             println!("Exiting. Thank you for using the agent!");
             break;
         }
 
-        // Skip empty input
         if user_prompt.is_empty() {
             continue;
         }
 
-        // Send instructions to AI
-        let mut seconds = 0;
+        shared_seconds.store(0, Ordering::SeqCst);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
         interval.tick().await;
 
-        let prompt_fut = agent.prompt(user_prompt).into_future();
-        tokio::pin!(prompt_fut);
+        print!("\rAgent is thinking... (0s)");
+        io::stdout().flush().expect("Failed to flush");
+
+        let chat_fut = agent
+            .chat(user_prompt, &mut conversation_history)
+            .into_future();
+        tokio::pin!(chat_fut);
 
         let response = loop {
             tokio::select! {
-                res = &mut prompt_fut => {
-                    seconds = 0;
-                    let _ = seconds;
+                res = &mut chat_fut => {
                     break res;
                 }
                 _ = interval.tick() => {
-                    seconds += 1;
-                    print!("\rAgent is thinking... ({}s)", seconds);
+                    let current = shared_seconds.fetch_add(1, Ordering::SeqCst) + 1;
+                    print!("\rAgent is thinking... ({}s)", current);
                     io::stdout().flush().expect("Failed to flush");
                 }
             }
         };
 
-        println!();
-
         match response {
-            Ok(response) => {
+            Ok(response_text) => {
                 println!("\n--- AI Response ---");
-                println!("{}", response);
+                println!("{}", response_text);
             }
             Err(e) => {
                 println!("\nError occurred: {}", e);
