@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::IntoFuture;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -19,6 +19,7 @@ struct CmdArgs {
 #[derive(Debug, Clone)]
 struct CliExecutionTool {
     seconds: Arc<AtomicU64>,
+    is_tool_running: Arc<AtomicBool>,
 }
 
 impl Tool for CliExecutionTool {
@@ -45,6 +46,7 @@ impl Tool for CliExecutionTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.is_tool_running.store(true, Ordering::SeqCst);
         self.seconds.store(0, Ordering::SeqCst);
 
         println!("\n[Tool Executing] Executing command: {}", args.command);
@@ -61,7 +63,7 @@ impl Tool for CliExecutionTool {
                 .await
         };
 
-        match output {
+        let res = match output {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -81,7 +83,9 @@ impl Tool for CliExecutionTool {
                 println!("[Tool Fatal] Failed to start the command itself.");
                 Ok(format!("Failed to execute command: {}", e))
             }
-        }
+        };
+        self.is_tool_running.store(false, Ordering::SeqCst);
+        res
     }
 }
 
@@ -91,7 +95,10 @@ struct SearchArgs {
 }
 
 #[derive(Debug, Clone)]
-struct DuckDuckGoSearchTool;
+struct DuckDuckGoSearchTool {
+    seconds: Arc<AtomicU64>,
+    is_tool_running: Arc<AtomicBool>,
+}
 
 impl Tool for DuckDuckGoSearchTool {
     const NAME: &'static str = "web_search";
@@ -117,6 +124,9 @@ impl Tool for DuckDuckGoSearchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.is_tool_running.store(true, Ordering::SeqCst);
+        self.seconds.store(0, Ordering::SeqCst);
+
         println!(
             "\n[Tool Executing] Searching the web with DuckDuckGo: {}",
             args.query
@@ -185,12 +195,13 @@ impl Tool for DuckDuckGoSearchTool {
                 count += 1;
             }
         }
-
-        if summary.is_empty() {
+        let res = if summary.is_empty() {
             Ok("No search results were found, or they were blocked.".to_string())
         } else {
             Ok(summary)
-        }
+        };
+        self.is_tool_running.store(false, Ordering::SeqCst);
+        res
     }
 }
 
@@ -200,7 +211,10 @@ struct FetchArgs {
 }
 
 #[derive(Debug, Clone)]
-struct FetchWebPageTool;
+struct FetchWebPageTool {
+    seconds: Arc<AtomicU64>,
+    is_tool_running: Arc<AtomicBool>,
+}
 
 impl Tool for FetchWebPageTool {
     const NAME: &'static str = "fetch_web_page";
@@ -226,7 +240,10 @@ impl Tool for FetchWebPageTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("\n[Tool Executing] Retrieving web page: {}", args.url);
+        self.is_tool_running.store(true, Ordering::SeqCst);
+        self.seconds.store(0, Ordering::SeqCst);
+
+        println!("\n[Tool Executing] Fetching a web page: {}", args.url);
 
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -260,16 +277,18 @@ impl Tool for FetchWebPageTool {
         }
 
         if text_content.len() > 20000 {
-            println!("\nOmitted due to character limit");
+            println!("Omitted due to character limit");
             text_content.truncate(20000);
             text_content.push_str("\n...[Omitted due to character limit]...");
         }
 
-        if text_content.is_empty() {
+        let res = if text_content.is_empty() {
             Ok("Could not retrieve the text from the web page.".to_string())
         } else {
             Ok(text_content)
-        }
+        };
+        self.is_tool_running.store(false, Ordering::SeqCst);
+        res
     }
 }
 
@@ -288,6 +307,8 @@ async fn main() {
     }
 
     let shared_seconds = Arc::new(AtomicU64::new(0));
+    let is_tool_running = Arc::new(AtomicBool::new(false));
+
     let ollama_client =
         ollama::Client::new("http://localhost:11434").expect("Failed to initialize Ollama client");
 
@@ -301,9 +322,9 @@ async fn main() {
             - Use `web_search` to find latest information, documentation, or generic knowledge from the internet.
             Choose the best tool based on the user's request.
         ")
-        .tool(CliExecutionTool { seconds: Arc::clone(&shared_seconds) })
-        .tool(DuckDuckGoSearchTool)
-        .tool(FetchWebPageTool)
+        .tool(CliExecutionTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
+        .tool(DuckDuckGoSearchTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
+        .tool(FetchWebPageTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
         .default_max_turns(10)
         .build();
 
@@ -350,9 +371,12 @@ async fn main() {
                     break res;
                 }
                 _ = interval.tick() => {
-                    let current = shared_seconds.fetch_add(1, Ordering::SeqCst) + 1;
-                    print!("\rAgent is thinking... ({}s)", current);
-                    io::stdout().flush().expect("Failed to flush");
+                    if is_tool_running.load(Ordering::SeqCst) == false {
+                        let current = shared_seconds.load(Ordering::SeqCst);
+                        print!("\rAgent is thinking... ({}s)", current);
+                        io::stdout().flush().expect("Failed to flush");
+                        shared_seconds.store(current + 1, Ordering::SeqCst);
+                    }
                 }
             }
         };
