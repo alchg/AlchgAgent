@@ -296,21 +296,46 @@ impl Tool for FetchWebPageTool {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut model_name = "gemma4".to_string();
+    let mut endpoint = "http://localhost:11434".to_string();
 
-    if let Some(pos) = args.iter().position(|x| x == "-m") {
-        if let Some(next_arg) = args.get(pos + 1) {
-            model_name = next_arg.clone();
-        } else {
-            eprintln!("Error: Please specify a model name after -m.");
-            std::process::exit(1);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" => {
+                if let Some(next_arg) = args.get(i + 1) {
+                    model_name = next_arg.clone();
+                    i += 2;
+                } else {
+                    eprintln!("Error: Please specify a model name after -m.");
+                    std::process::exit(1);
+                }
+            }
+            "-e" => {
+                if let Some(next_arg) = args.get(i + 1) {
+                    endpoint = next_arg.clone();
+                    i += 2;
+                } else {
+                    eprintln!("Error: Please specify an endpoint URL after -e.");
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
+
+    println!("==================================================");
+    println!("Ollama Host : {}", endpoint);
+    println!("Active Model: {}", model_name);
+    println!("CLI Agent started. Please give me any instructions.");
+    println!("   Type '/exit' to quit.");
+    println!("==================================================");
 
     let shared_seconds = Arc::new(AtomicU64::new(0));
     let is_tool_running = Arc::new(AtomicBool::new(false));
 
-    let ollama_client =
-        ollama::Client::new("http://localhost:11434").expect("Failed to initialize Ollama client");
+    let ollama_client = ollama::Client::new(endpoint).expect("Failed to initialize Ollama client");
 
     let mut conversation_history: Vec<Message> = vec![];
 
@@ -327,11 +352,6 @@ async fn main() {
         .tool(FetchWebPageTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
         .default_max_turns(10)
         .build();
-
-    println!("==================================================");
-    println!("CLI Agent started. Please give me any instructions.");
-    println!("   Type '/exit' to quit.");
-    println!("==================================================");
 
     loop {
         print!("\nUser>");
