@@ -1,11 +1,12 @@
+use futures::StreamExt;
 use rig::client::CompletionClient;
-use rig::completion::{Chat, Message, ToolDefinition};
+use rig::completion::{Message, ToolDefinition};
 use rig::providers::ollama;
+use rig::streaming::StreamingChat;
 use rig::tool::Tool;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::future::IntoFuture;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -263,27 +264,50 @@ impl Tool for FetchWebPageTool {
 
         let document = Html::parse_document(&html_content);
 
-        let body_selector = Selector::parse("body").unwrap();
-
         let mut text_content = String::new();
-        if let Some(body) = document.select(&body_selector).next() {
-            for text in body.text() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() && trimmed.len() > 1 {
-                    text_content.push_str(trimmed);
-                    text_content.push(' ');
+
+        let selectors = vec!["main", "article", "body"];
+        let mut target_element = None;
+
+        for sel in selectors {
+            if let Ok(selector) = Selector::parse(sel) {
+                if let Some(elem) = document.select(&selector).next() {
+                    target_element = Some(elem);
+                    break;
+                }
+            }
+        }
+
+        if let Some(body) = target_element {
+            for node in body.descendants() {
+                if let Some(element) = node.value().as_element() {
+                    match element.name() {
+                        "script" | "style" | "nav" | "footer" | "header" | "iframe"
+                        | "noscript" => continue,
+                        _ => {}
+                    }
+                }
+                if let Some(text) = node.value().as_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && trimmed.len() > 1 {
+                        text_content.push_str(trimmed);
+                        text_content.push(' ');
+                    }
                 }
             }
         }
 
         if text_content.len() > 20000 {
-            println!("Omitted due to character limit");
-            text_content.truncate(20000);
+            let mut limit = 20000;
+            while !text_content.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            text_content.truncate(limit);
             text_content.push_str("\n...[Omitted due to character limit]...");
         }
 
         let res = if text_content.is_empty() {
-            Ok("Could not retrieve the text from the web page.".to_string())
+            Ok("Could not retrieve relevant main text from the web page.".to_string())
         } else {
             Ok(text_content)
         };
@@ -347,6 +371,9 @@ async fn main() {
             - Use `web_search` to find latest information, documentation, or generic knowledge from the internet.
             Choose the best tool based on the user's request.
         ")
+        .additional_params(json!({
+            "num_predict": -1
+        }))
         .tool(CliExecutionTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
         .tool(DuckDuckGoSearchTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
         .tool(FetchWebPageTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
@@ -374,41 +401,56 @@ async fn main() {
         }
 
         shared_seconds.store(0, Ordering::SeqCst);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-        interval.tick().await;
+        let timer_seconds = Arc::clone(&shared_seconds);
+        let timer_tool_running = Arc::clone(&is_tool_running);
+        let timer_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            //interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                if timer_tool_running.load(Ordering::SeqCst) == false {
+                    let secs = timer_seconds.fetch_add(1, Ordering::SeqCst) + 1;
+                    print!("\rAgent is thinking... ({}s)", secs);
+                    let _ = io::stdout().flush();
+                }
+            }
+        });
 
         print!("\rAgent is thinking... (0s)");
         io::stdout().flush().expect("Failed to flush");
 
-        let chat_fut = agent
-            .chat(user_prompt, &mut conversation_history)
-            .into_future();
-        tokio::pin!(chat_fut);
+        let mut full_response = String::new();
+        let mut stream = agent
+            .stream_chat(user_prompt, conversation_history.clone())
+            .await;
 
-        let response = loop {
-            tokio::select! {
-                res = &mut chat_fut => {
-                    break res;
-                }
-                _ = interval.tick() => {
-                    if is_tool_running.load(Ordering::SeqCst) == false {
-                        let current = shared_seconds.load(Ordering::SeqCst);
-                        print!("\rAgent is thinking... ({}s)", current);
-                        io::stdout().flush().expect("Failed to flush");
-                        shared_seconds.store(current + 1, Ordering::SeqCst);
+        let mut is_first_chunk = true;
+        while let Some(chunk) = stream.next().await {
+            if let Ok(item) = chunk {
+                if let Ok(json) = serde_json::to_value(&item) {
+                    if json.get("type").and_then(|v| v.as_str()) == Some("streamAssistantItem") {
+                        if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                            if is_first_chunk {
+                                timer_handle.abort();
+                                println!("\n--- AI Response ---");
+                                is_first_chunk = false;
+                            }
+                            print!("{}", text);
+
+                            use std::io::{self, Write};
+                            let _ = io::stdout().flush();
+
+                            full_response.push_str(text);
+                        }
                     }
                 }
             }
-        };
-
-        match response {
-            Ok(response_text) => {
-                println!("\n--- AI Response ---");
-                println!("{}", response_text);
-            }
-            Err(e) => {
-                println!("\nError occurred: {}", e);
-            }
         }
+        if is_first_chunk {
+            timer_handle.abort();
+        }
+        conversation_history.push(rig::completion::Message::user(user_prompt.to_string()));
+        conversation_history.push(rig::completion::Message::assistant(full_response));
     }
 }
