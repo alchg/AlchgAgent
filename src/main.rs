@@ -2,6 +2,7 @@ use rig::client::CompletionClient;
 use rig::completion::{Chat, Message, ToolDefinition};
 use rig::providers::ollama;
 use rig::tool::Tool;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::IntoFuture;
@@ -29,9 +30,7 @@ impl Tool for CliExecutionTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Executes local OS commands (like ls, pwd, echo) to check the system status."
-                    .to_string(),
+            description: "Executes local OS commands (like ls, pwd, echo).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -86,6 +85,194 @@ impl Tool for CliExecutionTool {
     }
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+struct SearchArgs {
+    query: String,
+}
+
+#[derive(Debug, Clone)]
+struct DuckDuckGoSearchTool;
+
+impl Tool for DuckDuckGoSearchTool {
+    const NAME: &'static str = "web_search";
+    type Error = rig::tool::ToolError;
+    type Args = SearchArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Search the internet for the latest information.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search keywords (e.g., 'how to use Rust rig framework', 'latest news')"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!(
+            "\n[Tool Executing] Searching the web with DuckDuckGo: {}",
+            args.query
+        );
+
+        let url = "https://lite.duckduckgo.com/lite/";
+
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let res = client
+            .post(url)
+            .form(&[("q", &args.query)])
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let html_content = res
+            .text()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let document = Html::parse_document(&html_content);
+
+        let tr_selector = Selector::parse("table tr").unwrap();
+        let link_selector = Selector::parse("a.result-link").unwrap();
+        let snippet_selector = Selector::parse("td.result-snippet").unwrap();
+
+        let mut summary = String::new();
+        let mut count = 0;
+
+        let rows: Vec<_> = document.select(&tr_selector).collect();
+
+        for (i, row) in rows.iter().enumerate() {
+            if count >= 3 {
+                break;
+            }
+
+            if let Some(link_elem) = row.select(&link_selector).next() {
+                let title = link_elem
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim()
+                    .to_string();
+                let url = link_elem.value().attr("href").unwrap_or("").to_string();
+
+                let mut snippet = String::new();
+                if let Some(next_row) = rows.get(i + 1) {
+                    if let Some(snip_elem) = next_row.select(&snippet_selector).next() {
+                        snippet = snip_elem
+                            .text()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim()
+                            .to_string();
+                    }
+                }
+
+                summary.push_str(&format!(
+                    "- Title: {}\n  URL: {}\n  Snippet: {}\n\n",
+                    title, url, snippet
+                ));
+                count += 1;
+            }
+        }
+
+        if summary.is_empty() {
+            Ok("No search results were found, or they were blocked.".to_string())
+        } else {
+            Ok(summary)
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct FetchArgs {
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct FetchWebPageTool;
+
+impl Tool for FetchWebPageTool {
+    const NAME: &'static str = "fetch_web_page";
+    type Error = rig::tool::ToolError;
+    type Args = FetchArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Accesses the webpage at the specified URL and retrieves its content (body text). This is also used when you want to view the detailed content of a URL found via `web_search`.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The absolute URL of the web page to access."
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!("\n[Tool Executing] Retrieving web page: {}", args.url);
+
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let res = client
+            .get(&args.url)
+            .send()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let html_content = res
+            .text()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let document = Html::parse_document(&html_content);
+
+        let body_selector = Selector::parse("body").unwrap();
+
+        let mut text_content = String::new();
+        if let Some(body) = document.select(&body_selector).next() {
+            for text in body.text() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() && trimmed.len() > 1 {
+                    text_content.push_str(trimmed);
+                    text_content.push(' ');
+                }
+            }
+        }
+
+        if text_content.len() > 20000 {
+            println!("\nOmitted due to character limit");
+            text_content.truncate(20000);
+            text_content.push_str("\n...[Omitted due to character limit]...");
+        }
+
+        if text_content.is_empty() {
+            Ok("Could not retrieve the text from the web page.".to_string())
+        } else {
+            Ok(text_content)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -109,11 +296,15 @@ async fn main() {
     let agent = ollama_client
         .agent(&model_name)
         .preamble("
-            You are an excellent CLI (Command Line) agent that supports the user's PC operations.
-            Use the provided `execute_bash_command` tool appropriately to check the actual system status based on the user's instructions,
-            and answer the user based on those results.
+            You are an excellent CLI & Web agent.
+            - Use `execute_bash_command` to check local system status or run commands.
+            - Use `web_search` to find latest information, documentation, or generic knowledge from the internet.
+            Choose the best tool based on the user's request.
         ")
         .tool(CliExecutionTool { seconds: Arc::clone(&shared_seconds) })
+        .tool(DuckDuckGoSearchTool)
+        .tool(FetchWebPageTool)
+        .default_max_turns(10)
         .build();
 
     println!("==================================================");
