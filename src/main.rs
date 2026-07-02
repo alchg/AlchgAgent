@@ -372,6 +372,7 @@ async fn main() {
             Choose the best tool based on the user's request.
         ")
         .additional_params(json!({
+            "num_ctx": 64000,
             "num_predict": -1
         }))
         .tool(CliExecutionTool{seconds:Arc::clone(&shared_seconds),is_tool_running: Arc::clone(&is_tool_running),})
@@ -405,7 +406,6 @@ async fn main() {
         let timer_tool_running = Arc::clone(&is_tool_running);
         let timer_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-            //interval.tick().await;
 
             loop {
                 interval.tick().await;
